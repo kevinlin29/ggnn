@@ -32,6 +32,8 @@ limitations under the License.
 #include "ggnn/utils/cuda_knn_constants.cuh"
 #include "ggnn/utils/cuda_knn_dataset.cuh"
 #include "ggnn/utils/cuda_knn_ggnn_results.cuh"
+#include "ggnn/utils/cuda_knn_lsh.cuh" 
+
 
 
 // for storing generated ground truth data
@@ -75,12 +77,23 @@ struct GGNN {
   GGNNGPUInstance ggnn_gpu_instance;
   GGNNResults ggnn_results {&dataset};
 
+  LSH lsh;
+
   GGNN(const std::string& basePath, const std::string& queryPath,
-       const std::string& gtPath, const int L, const float tau_build,
-       const size_t N_base = std::numeric_limits<size_t>::max())
-      : dataset{basePath, queryPath, file_exists(gtPath) ? gtPath : "", N_base},
-        ggnn_gpu_instance{[](){int device; cudaGetDevice(&device); return device;}(), &dataset, dataset.N_base, L, true, tau_build} {
+    const std::string& gtPath, const int L, const float tau_build,
+    const int num_buckets, const int num_hash_functions,  // LSH params
+    const size_t N_base = std::numeric_limits<size_t>::max())
+   : dataset{basePath, queryPath, file_exists(gtPath) ? gtPath : "", N_base},
+     ggnn_gpu_instance{[](){int device; cudaGetDevice(&device); return device;}(), &dataset, dataset.N_base, L, true, tau_build},
+     lsh{num_hash_functions, num_buckets}  // Initialize LSH here
+  {
     CHECK_EQ(dataset.D, D) << "DIM needs to be the same";
+
+    // Preprocess the dataset using LSH
+    lsh.preprocess(dataset);
+
+    // Build GGNN graphs for each bucket created by LSH
+    buildGraphsForBuckets(lsh);
 
     const auto& shard = ggnn_gpu_instance.ggnn_shards.at(0);
     ggnn_gpu_instance.loadShardBaseDataAsync(0, 0);
@@ -90,10 +103,31 @@ struct GGNN {
       generateGTUsingBF();
       if (!gtPath.empty()) {
         LOG(INFO) << "exporting brute-forced ground truth data.";
-        IVecsStorer gt_storer(gtPath, dataset.K_gt,
-            dataset.N_query);
+        IVecsStorer gt_storer(gtPath, dataset.K_gt, dataset.N_query);
         gt_storer.store(dataset.gt, dataset.N_query);
       }
+    }
+  }
+
+  // Build GGNN graphs for each bucket created by LSH
+  void buildGraphsForBuckets(const LSH& lsh) {
+    for (int bucket_id = 0; bucket_id < lsh.num_buckets; ++bucket_id) {
+      if (!lsh.buckets[bucket_id].empty()) {
+        // Reinitialize graph for the subset of data points in this bucket
+        reinit_graph_for_subset(lsh.buckets[bucket_id].size());
+        ggnn_gpu_instance.build(bucket_id);  // Build GGNN graph for this bucket
+      }
+    }
+  }
+
+  // Query using LSH to select the correct GGNN graph
+  void queryWithLSH(const std::vector<float>& query_point) {
+    // Determine the bucket using LSH
+    int bucket_id = lsh.hash(query_point);
+
+    // Perform query on the GGNN graph for the corresponding bucket
+    if (bucket_id < ggnn_gpu_instance.size()) {
+      ggnn_gpu_instance[bucket_id].queryLayer();
     }
   }
 
